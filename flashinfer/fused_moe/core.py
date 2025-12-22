@@ -75,16 +75,12 @@ class RoutingMethodType(IntEnum):
 
 
 # Copied from csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+
+
 class ActivationType(IntEnum):
-    Gelu = 0
-    Relu = 1
-    Silu = 2
-    Swiglu = 3
-    Geglu = 4
-    SwigluBias = 5
-    Relu2 = 6
-    Identity = 7
-    InvalidType = 8
+    Swiglu = 0
+    Geglu = 1
+    Relu2 = 2
 
 
 class DtypeTrtllmGen(IntEnum):
@@ -177,6 +173,7 @@ class GatedActType(IntEnum):
     SwiGlu = 0
     # GeGlu
     GeGlu = 1
+    Relu2 = 2
 
 
 @functools.cache
@@ -1150,6 +1147,7 @@ def get_trtllm_moe_sm100_module():
                         kwargs["routing_method_type"],
                         kwargs["enable_pdl"],
                         [-1, -1] if tactic == -1 else tactic,
+                        kwargs["activation_type"],
                     )
             else:
                 moe_op.trtllm_fp4_block_scale_moe(
@@ -1366,6 +1364,7 @@ def get_trtllm_moe_sm100_module():
         routing_method_type: int = 0,
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
+        activation: GatedActType = GatedActType.SwiGlu,
     ) -> torch.Tensor:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(hidden_states.device)
@@ -1400,6 +1399,7 @@ def get_trtllm_moe_sm100_module():
             intermediate_size=intermediate_size,
             weight_layout=WeightLayout.MajorK,
             use_shuffled_weight=True,
+            gated_act_type=activation,
         )
 
         inputs = [output, routing_logits, topk_ids, expert_weights, hidden_states]
@@ -1424,6 +1424,7 @@ def get_trtllm_moe_sm100_module():
             use_routing_scales_on_input=use_routing_scales_on_input,
             routing_method_type=routing_method_type,
             enable_pdl=enable_pdl,
+            activation_type=activation.value,
         )
         # Call the C++ function
         result = moe_op.trtllm_fp8_per_tensor_scale_moe(
@@ -1448,6 +1449,7 @@ def get_trtllm_moe_sm100_module():
             routing_method_type,
             enable_pdl,
             [-1, -1] if tactic == -1 else tactic,
+            activation.value,
         )
 
         return result
@@ -1958,6 +1960,7 @@ def trtllm_fp8_per_tensor_scale_moe(
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
+    activation: ActivationType = ActivationType.Swiglu,
 ) -> torch.Tensor:
     """FP8 per tensor scale MoE operation.
 
@@ -2007,6 +2010,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         routing_method_type,
         enable_pdl,
         tune_max_num_tokens,
+        activation,
     )
 
 

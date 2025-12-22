@@ -143,6 +143,7 @@ enum class GatedActType : int64_t {
   SwiGlu = 0,
   // GeGlu
   GeGlu = 1,
+  Relu2 = 2,
 };
 
 inline std::string serializeGatedActType(GatedActType gatedActType) {
@@ -151,10 +152,17 @@ inline std::string serializeGatedActType(GatedActType gatedActType) {
       return "SwiGlu";
     case GatedActType::GeGlu:
       return "GeGlu";
+    case GatedActType::Relu2:
+      return "Relu2";
     default:
       return "InvalidGatedActType";  // TODO throw error
   };
 }
+
+inline bool isGatedActivation(GatedActType activationType) {
+  return activationType != GatedActType::Relu2;
+}
+
 }  // namespace MoE
 
 namespace PermuteGemm1 {
@@ -193,6 +201,7 @@ class Runner {
   batchedGemm::trtllm::gen::Dtype mDtypeWeights;
   int32_t mTileTokensDim;
   tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner mRunner;
+  tensorrt_llm::kernels::trtllmgen_moe::MoE::GatedActType mActType;
 };
 }  // namespace PermuteGemm1
 
@@ -258,6 +267,8 @@ struct MoERunnerArgs {
   float* gemm1_beta = nullptr;
   float* gemm1_clamp_limit = nullptr;
   float* gemm2_bias = nullptr;
+
+  GatedActType gemm_act_type = GatedActType::SwiGlu;
 
   int32_t num_tokens{0};
   int32_t num_experts{0};

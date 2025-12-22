@@ -248,10 +248,14 @@ def gen_trtllm_gen_fused_moe_sm100_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_routing_renormalize.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_fused_moe_dev_kernel.cu",
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_batched_gemm_runner.cu",
+            *(
+                jit_env.FLASHINFER_INCLUDE_DIR
+                / "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/cubins"
+            ).rglob("*.cpp"),
         ],
         extra_cuda_cflags=[
             "-DTLLM_GEN_EXPORT_INTERFACE",
-            "-DTLLM_GEN_EXPORT_FLASHINFER",
+            # "-DTLLM_GEN_EXPORT_FLASHINFER",
             "-DTLLM_ENABLE_CUDA",
             "-DENABLE_BF16",
             "-DENABLE_FP8",

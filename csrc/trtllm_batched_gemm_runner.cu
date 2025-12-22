@@ -109,6 +109,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
           continue;
         }
       }
+      if ((int64_t)options.mGemmActType != (int64_t)mOptions.gemmActType) {
+        continue;
+      }
 
       if (mOptions.transposeMmaOutput && options.mEpilogueTileM == mOptions.epilogueTileM) {
         mPassingConfigIndices.push_back(i);
@@ -122,6 +125,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
             << ", mDtypeB: " << tg::dtypeToString(mOptions.dtypeB)
             << ", mDtypeC: " << tg::dtypeToString(mOptions.dtypeC)
             << ", mUseDeepSeekFp8: " << mOptions.deepSeekFp8
+            << ", mGemmActType: " << (int64_t)mOptions.gemmActType
             << ", mTransposeMmaOutput: " << mOptions.transposeMmaOutput
             << ", mRouteAct: " << mOptions.routeAct << ", mFusedAct: " << mOptions.fusedAct
             << ", mIsStaticBatch: " << mOptions.staticBatch << ", mTileSize: " << mOptions.tileSize;

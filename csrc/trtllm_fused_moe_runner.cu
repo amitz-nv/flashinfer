@@ -212,6 +212,25 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .useShuffledMatrixA = useShuffledMatrixA,
         .weightLayout = weightLayout};
     return options;
+  } else if (gatedActType == MoE::GatedActType::Relu2) {
+    GemmActType actType = GemmActType::Relu2;
+    tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {
+        // Swap A and B dtypes because transposeMmaOutput is hardcoded to true
+        .dtypeA = dtypeWeights,
+        .dtypeB = dtypeAct,
+        .dtypeC = dtypeAct,
+        .gemmActType = actType,
+        // .gemmActType = GemmActType::None,
+        .deepSeekFp8 = useDeepSeekFp8,
+        .fusedAct = false,
+        .routeAct = true,
+        .staticBatch = false,
+        .transposeMmaOutput = true,
+        .tileSize = tileTokensDim,
+        .epilogueTileM = 128,
+        .useShuffledMatrixA = useShuffledMatrixA,
+        .weightLayout = weightLayout};
+    return options;
   } else {
     FLASHINFER_CHECK(false, "Unimplemented gated act type ",
                      MoE::serializeGatedActType(gatedActType), " of enum ", (int)gatedActType);
@@ -226,7 +245,8 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
       mTileTokensDim(tileTokensDim),
       mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
           getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, gatedActType,
-                     useShuffledMatrixA, weightLayout))) {}
+                     useShuffledMatrixA, weightLayout))),
+      mActType(gatedActType) {}
 
 void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void* weightsScale,
                  void* expertWeights, float* outputScalesScalar, float* outputScalesGateScalar,
@@ -239,12 +259,15 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  mRunner.run(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens, numExperts,
-              maxNumCtasInBatchDim, hiddenState, hiddenStateScale, weights, weightsScale,
-              expertWeights, /* perTokensSfB */ nullptr, outputScalesScalar, outputScalesGateScalar,
-              ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, output, outputScale, permutedIdxToTokenIdx,
-              ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit,
-              ptrNumNonExitingCtas, bmm1Workspace, stream, device, configIndex, enable_pdl);
+  mRunner.run(numTokens,
+              (tensorrt_llm::kernels::trtllmgen_moe::MoE::isGatedActivation(mActType) ? 2 : 1) *
+                  intermediateSize,
+              hiddenSize, {}, numTokens, numExperts, maxNumCtasInBatchDim, hiddenState,
+              hiddenStateScale, weights, weightsScale, expertWeights, /* perTokensSfB */ nullptr,
+              outputScalesScalar, outputScalesGateScalar, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit,
+              output, outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens,
+              ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, bmm1Workspace,
+              stream, device, configIndex, enable_pdl);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -252,7 +275,7 @@ size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t
                                        int32_t configIndex) const {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  return mRunner.getWorkspaceSizeInBytes(numTokens, 2 * intermediateSize, hiddenSize, {}, numTokens,
+  return mRunner.getWorkspaceSizeInBytes(numTokens, intermediateSize, hiddenSize, {}, numTokens,
                                          numExperts, maxNumCtasInBatchDim, configIndex);
 }
 
@@ -261,8 +284,8 @@ int32_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
                                            int32_t numTokens) const {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
-  return mRunner.getDefaultValidConfigIndex(numTokens, 2 * intermediateSize, hiddenSize, {},
-                                            numTokens, numExperts, maxNumCtasInBatchDim);
+  return mRunner.getDefaultValidConfigIndex(numTokens, intermediateSize, hiddenSize, {}, numTokens,
+                                            numExperts, maxNumCtasInBatchDim);
 }
 
 bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hiddenSize,
@@ -272,7 +295,7 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
 
   auto const isValid =
-      mRunner.isValidConfigIndex(configIndex, numTokens, 2 * intermediateSize, hiddenSize, {},
+      mRunner.isValidConfigIndex(configIndex, numTokens, intermediateSize, hiddenSize, {},
                                  numTokens, numExperts, maxNumCtasInBatchDim);
 
   return isValid;
@@ -292,6 +315,7 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
       .dtypeA = dtypeWeights,
       .dtypeB = dtypeAct,
       .dtypeC = dtypeOut,
+      .gemmActType = GemmActType::None,
       .deepSeekFp8 = useDeepSeekFp8,
       .fusedAct = false,
       .routeAct = false,
@@ -420,7 +444,9 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.outPtr = workspace.activation_output;
   activationData.inDqSfsPtr = workspace.gemm1_output_scale;
   activationData.outDqSfsPtr = workspace.activation_output_scale;
-  activationData.innerDim = args.intermediate_size * 2;
+  activationData.innerDim =
+      args.intermediate_size *
+      (tensorrt_llm::kernels::trtllmgen_moe::MoE::isGatedActivation(args.gemm_act_type) ? 2 : 1);
   activationData.topK = args.top_k;
   activationData.numTokens = args.num_tokens;
   activationData.expandedIdxToPermutedIdx = workspace.expanded_idx_to_permuted_idx;

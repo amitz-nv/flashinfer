@@ -400,9 +400,10 @@ void FusedMoeLauncher::init_common(
   TVM_FFI_ICHECK(0 <= weight_layout && weight_layout <= 2)
       << "the value of weight_layout is not recognized";
   this->weight_layout = static_cast<batchedGemm::gemm::MatrixLayout>(weight_layout);
-  TVM_FFI_ICHECK(0 <= gated_act_type && gated_act_type <= 1)
+  TVM_FFI_ICHECK(0 <= gated_act_type && gated_act_type <= 2)
       << "the value of gated_act_type is not recognized";
   this->gated_act_type = static_cast<GatedActType>(gated_act_type);
+  this->args->gemm_act_type = this->gated_act_type;
 }
 
 class Bf16MoeLauncher : public FusedMoeLauncher {
@@ -519,7 +520,8 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
 
 class Fp8PerTensorLauncher : public FusedMoeLauncher {
  public:
-  static constexpr std::array<int32_t, 5> mSupportedTileNums = {8, 16, 32, 64, 128};
+  // static constexpr std::array<int32_t, 5> mSupportedTileNums = {8, 16, 32, 64, 128};
+  static constexpr std::array<int32_t, 2> mSupportedTileNums = {8, 64};
 
   // Constructor that passes TensorView parameters to base constructor
   Fp8PerTensorLauncher(TensorView const& routing_logits, Optional<TensorView> const& routing_bias,
@@ -535,9 +537,9 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
 
   void init(std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::MoERunnerArgs>&& args,
             int64_t tile_tokens_dim, int64_t routing_method_type, bool use_shuffled_weight,
-            int64_t weight_layout, bool use_routing_scales_on_input_param) {
-    constexpr int64_t gated_act_type =
-        static_cast<int64_t>(GatedActType::SwiGlu);  // not exposed in api for now
+            int64_t weight_layout, bool use_routing_scales_on_input_param,
+            GatedActType activation = GatedActType::SwiGlu) {
+    int64_t gated_act_type = static_cast<int64_t>(activation);
 
     this->use_routing_scales_on_input = use_routing_scales_on_input_param;
 
@@ -633,18 +635,21 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
 
     int32_t max_num_padded_tokens_gemm1 = workspace.total_max_padded_tokens + args->num_experts;
     int32_t max_num_padded_tokens_gemm2 = workspace.total_max_padded_tokens;
+    bool usingGatedAcitvation =
+        tensorrt_llm::kernels::trtllmgen_moe::MoE::isGatedActivation(gated_act_type);
+    uint8_t gemm1_intermediate_dim_factor = usingGatedAcitvation ? 2 : 1;
 
-    gemm1_output = alloc_tensor({max_num_padded_tokens_gemm1, 2 * args->intermediate_size},
-                                dl_uint8, hidden_states.device());
-    gemm1_output_scale =
-        alloc_tensor({2 * args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
-                     hidden_states.device());
+    gemm1_output = alloc_tensor(
+        {max_num_padded_tokens_gemm1, gemm1_intermediate_dim_factor * args->intermediate_size},
+        dl_uint8, hidden_states.device());
+    gemm1_output_scale = alloc_tensor({args->intermediate_size / 64, max_num_padded_tokens_gemm1},
+                                      dl_float32, hidden_states.device());
 
     activation_output = alloc_tensor({max_num_padded_tokens_gemm1, args->intermediate_size},
                                      dl_uint8, hidden_states.device());
-    activation_output_scale =
-        alloc_tensor({args->intermediate_size / 128, max_num_padded_tokens_gemm1}, dl_float32,
-                     hidden_states.device());
+    activation_output_scale = alloc_tensor(
+        {args->intermediate_size / (usingGatedAcitvation ? 128 : 64), max_num_padded_tokens_gemm1},
+        dl_float32, hidden_states.device());
 
     gemm2_output = alloc_tensor({max_num_padded_tokens_gemm2, args->hidden_size}, dl_bfloat16,
                                 hidden_states.device());
@@ -1328,9 +1333,10 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
     Optional<int64_t> n_group, Optional<int64_t> topk_group, int64_t intermediate_size,
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     bool use_routing_scales_on_input, int64_t routing_method_type, bool enable_pdl,
-    Array<int64_t> config_index) {
+    Array<int64_t> config_index, int64_t activation_type) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
+  auto activation = static_cast<GatedActType>(activation_type);
   if (use_routing_scales_on_input) {
     TVM_FFI_ICHECK_EQ(routing_logits.dtype(), dl_bfloat16) << "routing_logits must be bfloat16.";
   } else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3) {
@@ -1387,7 +1393,7 @@ Tensor trtllm_fp8_per_tensor_scale_moe(
         routing_logits, routing_bias, hidden_states, gemm1_weights, output1_scales_scalar,
         output1_scales_gate_scalar, gemm2_weights, output2_scales_scalar);
     launcher->init(std::move(args), curr_tile_N, routing_method_type, use_shuffled_weight,
-                   weight_layout, use_routing_scales_on_input);
+                   weight_layout, use_routing_scales_on_input, activation);
 
     launchers_map[curr_tile_N] = std::move(launcher);
   }

@@ -47,11 +47,32 @@ enum class ActType {
   GeGlu,
 };
 
+enum class GemmActType {
+  None = 0,
+  // For ActType == SwiGlu, ideally we would like to have something like
+  //    gatedAct = quantScaleC * (x0 * dequantScaleAb + beta) * ((x1 * scaleGate) *
+  //    sigmoid(alpha * x1 * scaleGate)).
+  // But for now, we use the simplified version
+  //    gatedAct = scaleC * (x0 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
+  // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+  // beta' = beta / dequantScaleAb, scaleC = quantScaleC * dequantScaleAb.
+  //
+  // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
+  SwiGlu,
+  // For ActType == GeGlu, we use the simplified version
+  //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * phi(alpha * x1 * scaleGate)),
+  // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+  // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
+  GeGlu,
+  Relu2,
+};
+
 struct TrtllmGenBatchedGemmRunnerOptions {
   batchedGemm::trtllm::gen::Dtype dtypeA;
   batchedGemm::trtllm::gen::Dtype dtypeB;
   batchedGemm::trtllm::gen::Dtype dtypeC;
   ActType actType{ActType::SwiGlu};
+  GemmActType gemmActType{GemmActType::None};
   bool deepSeekFp8{false};
   bool fusedAct{false};
   bool routeAct{false};
