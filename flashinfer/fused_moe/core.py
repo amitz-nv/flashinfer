@@ -193,6 +193,173 @@ class Fp8QuantizationType(IntEnum):
     MxFp8 = 2
 
 
+# Expert usage histogram instrumentation.
+_EXPERT_HIST_NUM_EXPERTS = 512
+_EXPERT_HIST_PRINT_EVERY = 400
+_expert_hist_model_iter = 0
+_expert_hist_last_printed_iter = 0
+_expert_hist_iteration_anchor_layer: Optional[int] = None
+_expert_hist_counts_by_layer: Dict[int, torch.Tensor] = {}
+
+
+def _normalize_expert_hist_layer_id(layer_id: Optional[int]) -> int:
+    return -1 if layer_id is None else int(layer_id)
+
+
+def _advance_expert_hist_iteration(layer_id: int) -> int:
+    """Advance model-iteration counter for histogram reporting.
+
+    For layer-aware callers, one model iteration is counted when the anchor
+    layer (smallest seen layer id on this rank) is observed. For callers
+    without layer information, each call is treated as one iteration.
+    """
+
+    global _expert_hist_model_iter, _expert_hist_iteration_anchor_layer
+    if layer_id < 0:
+        _expert_hist_model_iter += 1
+        return _expert_hist_model_iter
+
+    if (
+        _expert_hist_iteration_anchor_layer is None
+        or layer_id < _expert_hist_iteration_anchor_layer
+    ):
+        _expert_hist_iteration_anchor_layer = layer_id
+
+    if layer_id == _expert_hist_iteration_anchor_layer:
+        _expert_hist_model_iter += 1
+
+    return _expert_hist_model_iter
+
+
+def _maybe_log_layerwise_expert_histograms(current_iter: int) -> None:
+    global _expert_hist_last_printed_iter
+    if current_iter <= 0:
+        return
+    if current_iter % _EXPERT_HIST_PRINT_EVERY != 0:
+        return
+    if current_iter == _expert_hist_last_printed_iter:
+        return
+
+    _expert_hist_last_printed_iter = current_iter
+    sorted_items = sorted(_expert_hist_counts_by_layer.items(), key=lambda kv: kv[0])
+    hist_by_layer = {layer: hist.tolist() for layer, hist in sorted_items}
+    print(
+        f"[fused_moe] iteration={current_iter} "
+        "cumulative_expert_use_histogram_512_per_layer="
+        f"{hist_by_layer}"
+    )
+
+
+def _update_and_maybe_log_expert_usage_histogram(
+    token_selected_experts: torch.Tensor,
+    layer_id: Optional[int] = None,
+) -> None:
+    """Accumulate expert usage for a layer and log all layers every N iterations."""
+
+    layer_key = _normalize_expert_hist_layer_id(layer_id)
+    current_iter = _advance_expert_hist_iteration(layer_key)
+
+    global _expert_hist_counts_by_layer
+    if layer_key not in _expert_hist_counts_by_layer:
+        _expert_hist_counts_by_layer[layer_key] = torch.zeros(
+            _EXPERT_HIST_NUM_EXPERTS, dtype=torch.int64
+        )
+    layer_hist = _expert_hist_counts_by_layer[layer_key]
+
+    with torch.no_grad():
+        expert_ids = token_selected_experts.reshape(-1).to(torch.int64)
+        if expert_ids.numel() > 0:
+            if not torch.all(
+                (expert_ids >= 0) & (expert_ids < _EXPERT_HIST_NUM_EXPERTS)
+            ):
+                raise AssertionError(
+                    f"Decoded expert ids out of range [0, {_EXPERT_HIST_NUM_EXPERTS - 1}]: "
+                    f"min={int(expert_ids.min().item())}, max={int(expert_ids.max().item())}"
+                )
+        batch_hist = torch.bincount(
+            expert_ids, minlength=_EXPERT_HIST_NUM_EXPERTS
+        )[:_EXPERT_HIST_NUM_EXPERTS]
+        # Keep accumulators on CPU to avoid cross-device add errors.
+        layer_hist += batch_hist.to(layer_hist.device)
+
+    _maybe_log_layerwise_expert_histograms(current_iter)
+
+
+def _extract_expert_ids_from_packed_topk_ids(
+    topk_ids: torch.Tensor,
+    expert_id_in_upper_16_bits: bool,
+) -> torch.Tensor:
+    """Extract expert ids from packed int32 topk_ids using explicit bit layout."""
+
+    topk_ids_i64 = topk_ids.to(torch.int64)
+    if expert_id_in_upper_16_bits:
+        return (topk_ids_i64 >> 16) & 0xFFFF
+    return topk_ids_i64 & 0xFFFF
+
+
+def _decode_expert_ids_with_range_validation(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    expert_id_in_upper_16_bits: bool,
+) -> torch.Tensor:
+    """Decode expert ids from packed topk_ids and validate range.
+
+    Falls back to the opposite 16-bit half if the preferred layout decodes out-of-range
+    ids, which helps catch layout mismatches in routed paths.
+    """
+
+    if num_experts <= 0:
+        raise AssertionError(f"num_experts must be positive, got {num_experts}")
+
+    ids_primary = _extract_expert_ids_from_packed_topk_ids(
+        topk_ids, expert_id_in_upper_16_bits=expert_id_in_upper_16_bits
+    )
+    if ids_primary.numel() == 0:
+        return ids_primary
+
+    in_primary_range = torch.all((ids_primary >= 0) & (ids_primary < num_experts))
+    if in_primary_range:
+        return ids_primary
+
+    ids_alternate = _extract_expert_ids_from_packed_topk_ids(
+        topk_ids, expert_id_in_upper_16_bits=(not expert_id_in_upper_16_bits)
+    )
+    in_alternate_range = torch.all(
+        (ids_alternate >= 0) & (ids_alternate < num_experts)
+    )
+    if in_alternate_range:
+        logger.warning_once(
+            "[fused_moe] Histogram decode fallback: preferred packed expert-id layout "
+            "decoded out-of-range values; using alternate 16-bit half."
+        )
+        return ids_alternate
+
+    raise AssertionError(
+        "Decoded expert ids out of range for both packed layouts: "
+        f"num_experts={num_experts}, "
+        f"primary_min={int(ids_primary.min().item())}, "
+        f"primary_max={int(ids_primary.max().item())}, "
+        f"alternate_min={int(ids_alternate.min().item())}, "
+        f"alternate_max={int(ids_alternate.max().item())}"
+    )
+
+
+def _update_and_maybe_log_expert_usage_histogram_from_topk_ids(
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    expert_id_in_upper_16_bits: bool,
+    layer_id: Optional[int] = None,
+) -> None:
+    """Update expert usage histogram from packed/plain topk_ids tensor."""
+
+    expert_ids = _decode_expert_ids_with_range_validation(
+        topk_ids,
+        num_experts=num_experts,
+        expert_id_in_upper_16_bits=expert_id_in_upper_16_bits,
+    )
+    _update_and_maybe_log_expert_usage_histogram(expert_ids, layer_id=layer_id)
+
+
 @functools.cache
 def is_trtllm_moe_supported(
     dtype_weights: DtypeTrtllmGen,
@@ -1867,6 +2034,7 @@ def get_trtllm_moe_sm100_module():
         activation_type: int = ActivationType.Swiglu.value,
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
+        layer_id: Optional[int] = None,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -2011,6 +2179,14 @@ def get_trtllm_moe_sm100_module():
             output,
             [-1, -1] if tactic == -1 else tactic,
         )
+
+        _update_and_maybe_log_expert_usage_histogram_from_topk_ids(
+            topk_ids,
+            num_experts=num_experts,
+            expert_id_in_upper_16_bits=False,
+            layer_id=layer_id,
+        )
+
         if do_finalize:
             return [output]
         else:
@@ -2054,6 +2230,7 @@ def get_trtllm_moe_sm100_module():
         activation_type: int,
         output: Optional[torch.Tensor],
         tune_max_num_tokens: int,
+        layer_id: Optional[int],
     ):
         seq_len = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
@@ -2391,6 +2568,12 @@ def trtllm_bf16_routed_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _update_and_maybe_log_expert_usage_histogram_from_topk_ids(
+        topk_ids,
+        num_experts=num_experts,
+        expert_id_in_upper_16_bits=True,
+    )
+
     result = get_trtllm_moe_sm100_module().trtllm_bf16_moe(
         None,
         None,
@@ -2686,6 +2869,12 @@ def trtllm_fp8_block_scale_routed_moe(
         when do_finalize=True, returns the final MoE output.
         otherwise, returns the intermediate results (gemm2_output, undefined, expanded_idx_to_permuted_idx) that need further processing.
     """
+    _update_and_maybe_log_expert_usage_histogram_from_topk_ids(
+        topk_ids,
+        num_experts=num_experts,
+        expert_id_in_upper_16_bits=True,
+    )
+
     result = get_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         None,  # routing_logits
         topk_ids,
@@ -2756,6 +2945,7 @@ def trtllm_fp4_block_scale_moe(
     activation_type: int = ActivationType.Swiglu.value,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    layer_id: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -2853,6 +3043,7 @@ def trtllm_fp4_block_scale_moe(
         activation_type,
         output,
         tune_max_num_tokens,
+        layer_id,
     )
 
 
@@ -2888,6 +3079,7 @@ def trtllm_fp4_block_scale_routed_moe(
     activation_type: int = ActivationType.Swiglu.value,
     output: Optional[torch.Tensor] = None,
     tune_max_num_tokens: int = 8192,
+    layer_id: Optional[int] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation.
 
@@ -2987,6 +3179,7 @@ def trtllm_fp4_block_scale_routed_moe(
         activation_type,
         output,
         tune_max_num_tokens,
+        layer_id,
     )
 
 
