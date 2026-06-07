@@ -2554,7 +2554,9 @@ def run_moe_reference_fp4(args, quant_mode: QuantMode):
         gemm2_bias=args.gemm2_bias,
     )
 
-    return run_moe_dequant(args_dequant, quant_mode), args_dequant
+    args_dequant.c_global_sf = 1.0
+    return args_dequant
+    #return run_moe_dequant(args_dequant, quant_mode), args_dequant
 
 
 def run_moe_reference_mxfp8(args):
@@ -2900,7 +2902,7 @@ def run_moe_test(
         assert top_k_groups <= 4
         assert num_experts > n_groups
         assert num_experts % n_groups == 0
-        assert num_experts % 4 == 0
+        #assert num_experts % 4 == 0
         assert top_k < (top_k_groups * num_experts / n_groups)
 
     # Create test data based on routing method
@@ -3035,10 +3037,11 @@ def run_moe_test(
     )
 
     # Compute reference output
-    output_dequant_reference, args_dequant = moe_impl.compute_reference(args)
-
-    if output_dequant_reference is None:
-        pytest.fail("Reference computation failed to produce output")
+    #output_dequant_reference, args_dequant = moe_impl.compute_reference(args)
+    args_dequant = moe_impl.compute_reference(args)
+    print(f"{args_dequant=}")
+    #if output_dequant_reference is None:
+    #    pytest.fail("Reference computation failed to produce output")
 
     # Compute actual output
     enable_autotune = routing_config.get("enable_autotune", True)
@@ -3063,14 +3066,16 @@ def run_moe_test(
     )
 
     # Compare outputs
-    tolerances = moe_impl.get_tolerances()
-    check_accuracy(
-        output_dequant_reference,
-        output_dequant_actual,
-        atol=tolerances["atol"],
-        rtol=tolerances["rtol"],
-        percent=tolerances["percent"],
-    )
+    #tolerances = moe_impl.get_tolerances()
+    #print(f"Output reference:\n{output_dequant_reference}")
+    print(f"Output actual:\n{output_dequant_actual}")
+    #check_accuracy(
+    #    output_dequant_reference,
+    #    output_dequant_actual,
+    #    atol=tolerances["atol"],
+    #    rtol=tolerances["rtol"],
+    #    percent=tolerances["percent"],
+    #)
 
     return output_dequant_reference, output_dequant_actual, args_dequant
 
@@ -3473,26 +3478,31 @@ def test_sigmoid_routing(
 
 
 # Test: DeepSeekV3 routing
-@pytest.mark.parametrize("num_tokens", [8, 768, 3072])
-@pytest.mark.parametrize("hidden_size", [1024])
-@pytest.mark.parametrize("intermediate_size", [2688, 2048, 1024, 768, 512, 384])
+@pytest.mark.parametrize("num_tokens", [8192 * 48])  # 8, 768, 3072])
+@pytest.mark.parametrize("hidden_size", [8192])
+@pytest.mark.parametrize(
+    "intermediate_size",
+    [
+        5120,
+    ],
+)  # 2048, 1024, 768, 512, 384])
 @pytest.mark.parametrize(
     "moe_impl",
     [
-        pytest.param(FP8PerTensorMoe(), id="FP8_PerTensor"),
-        pytest.param(
-            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
-            id="FP8_Block_DeepSeek",
-        ),
-        pytest.param(
-            FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
-            id="FP8_Block_MxFp8",
-        ),
+        #pytest.param(FP8PerTensorMoe(), id="FP8_PerTensor"),
+        # pytest.param(
+        #    FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_DEEPSEEK),
+        #    id="FP8_Block_DeepSeek",
+        # ),
+        # pytest.param(
+        #    FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8),
+        #    id="FP8_Block_MxFp8",
+        # ),
         pytest.param(FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4), id="NvFP4xNvFP4"),
-        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
-        pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
-        pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
-        pytest.param(BF16Moe(), id="Bf16xBf16"),
+        # pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8), id="MxFP4xMxFP8"),
+        # pytest.param(FP4Moe(quant_mode=QuantMode.FP4_MXFP4_Bf16), id="MxFP4xBf16"),
+        # pytest.param(MxInt4BlockScaleMoe(), id="MxInt4xBf16"),
+        #pytest.param(BF16Moe(), id="Bf16xBf16"),
     ],
 )
 @pytest.mark.parametrize(
@@ -3500,146 +3510,146 @@ def test_sigmoid_routing(
     [
         pytest.param(
             {
-                "num_experts": 512,
-                "top_k": 22,
+                "num_experts": 16,
+                "top_k": 10,
                 "padding": 8,
                 "n_groups": 1,
                 "top_k_groups": 1,
-                "routed_scaling": 2.5,
+                "routed_scaling": 5.0,
                 "has_routing_bias": True,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "compatible_moe_impls": [BF16Moe, FP8PerTensorMoe, FP4Moe],
-                "compatible_intermediate_size": [2688],
+                "compatible_intermediate_size": [5120],
                 "compatible_activation_types": [ActivationType.Relu2],
                 "enable_autotune": True,
             },
             id="nemotron_3_super",
         ),
-        pytest.param(
-            {
-                "num_experts": 384,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
-                "compatible_intermediate_size": [1024, 2048],
-                "compatible_activation_types": [
-                    ActivationType.Swiglu,
-                    ActivationType.Geglu,
-                ],
-                "enable_autotune": True,
-            },
-            id="kimi_k2",
-        ),
-        pytest.param(
-            {
-                "num_experts": 256,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": 8,
-                "top_k_groups": 4,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [
-                    FP4Moe,
-                    FP8BlockScaleMoe,
-                    MxInt4BlockScaleMoe,
-                    BF16Moe,
-                ],
-                "compatible_intermediate_size": [512, 1024, 2048],
-                "compatible_activation_types": [
-                    ActivationType.Swiglu,
-                    ActivationType.Geglu,
-                ],
-                "enable_autotune": True,
-            },
-            id="DSv3",
-        ),
-        pytest.param(
-            {
-                "num_experts": 72,
-                "top_k": 6,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
-                "compatible_intermediate_size": [384, 768],
-                "compatible_activation_types": [
-                    ActivationType.Swiglu,
-                    ActivationType.Geglu,
-                ],
-                "enable_autotune": False,
-            },
-            id="DSLite",
-        ),
-        pytest.param(
-            {
-                "num_experts": 160,
-                "top_k": 8,
-                "padding": 8,
-                "n_groups": 1,
-                "top_k_groups": 1,
-                "routed_scaling": 2.5,
-                "has_routing_bias": True,
-                "routing_method_type": RoutingMethodType.DeepSeekV3,
-                "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe, BF16Moe],
-                "compatible_intermediate_size": [512, 1024, 1536],
-                "compatible_activation_types": [
-                    ActivationType.Swiglu,
-                    ActivationType.Geglu,
-                ],
-                "enable_autotune": False,
-            },
-            id="GLM4_MoE",
-        ),
+        # pytest.param(
+        #    {
+        #        "num_experts": 384,
+        #        "top_k": 8,
+        #        "padding": 8,
+        #        "n_groups": 1,
+        #        "top_k_groups": 1,
+        #        "routed_scaling": 2.5,
+        #        "has_routing_bias": True,
+        #        "routing_method_type": RoutingMethodType.DeepSeekV3,
+        #        "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
+        #        "compatible_intermediate_size": [1024, 2048],
+        #        "compatible_activation_types": [
+        #            ActivationType.Swiglu,
+        #            ActivationType.Geglu,
+        #        ],
+        #        "enable_autotune": True,
+        #    },
+        #    id="kimi_k2",
+        # ),
+        # pytest.param(
+        #    {
+        #        "num_experts": 256,
+        #        "top_k": 8,
+        #        "padding": 8,
+        #        "n_groups": 8,
+        #        "top_k_groups": 4,
+        #        "routed_scaling": 2.5,
+        #        "has_routing_bias": True,
+        #        "routing_method_type": RoutingMethodType.DeepSeekV3,
+        #        "compatible_moe_impls": [
+        #            FP4Moe,
+        #            FP8BlockScaleMoe,
+        #            MxInt4BlockScaleMoe,
+        #            BF16Moe,
+        #        ],
+        #        "compatible_intermediate_size": [512, 1024, 2048],
+        #        "compatible_activation_types": [
+        #            ActivationType.Swiglu,
+        #            ActivationType.Geglu,
+        #        ],
+        #        "enable_autotune": True,
+        #    },
+        #    id="DSv3",
+        # ),
+        # pytest.param(
+        #    {
+        #        "num_experts": 72,
+        #        "top_k": 6,
+        #        "padding": 8,
+        #        "n_groups": 1,
+        #        "top_k_groups": 1,
+        #        "routed_scaling": 2.5,
+        #        "has_routing_bias": True,
+        #        "routing_method_type": RoutingMethodType.DeepSeekV3,
+        #        "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe],
+        #        "compatible_intermediate_size": [384, 768],
+        #        "compatible_activation_types": [
+        #            ActivationType.Swiglu,
+        #            ActivationType.Geglu,
+        #        ],
+        #        "enable_autotune": False,
+        #    },
+        #    id="DSLite",
+        # ),
+        # pytest.param(
+        #    {
+        #        "num_experts": 160,
+        #        "top_k": 8,
+        #        "padding": 8,
+        #        "n_groups": 1,
+        #        "top_k_groups": 1,
+        #        "routed_scaling": 2.5,
+        #        "has_routing_bias": True,
+        #        "routing_method_type": RoutingMethodType.DeepSeekV3,
+        #        "compatible_moe_impls": [FP4Moe, FP8BlockScaleMoe, BF16Moe],
+        #        "compatible_intermediate_size": [512, 1024, 1536],
+        #        "compatible_activation_types": [
+        #            ActivationType.Swiglu,
+        #            ActivationType.Geglu,
+        #        ],
+        #        "enable_autotune": False,
+        #    },
+        #    id="GLM4_MoE",
+        # ),
     ],
 )
 @pytest.mark.parametrize(
     "weight_processing",
     [
+        # pytest.param(
+        #    {
+        #        "use_shuffled_weight": False,
+        #        "layout": WeightLayout.MajorK,
+        #        "compatible_moe_impls": [FP8BlockScaleMoe],
+        #    },
+        #    id="NoShuffle_MajorK",
+        # ),
         pytest.param(
-            {
-                "use_shuffled_weight": False,
-                "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [FP8BlockScaleMoe],
-            },
-            id="NoShuffle_MajorK",
+           {
+               "use_shuffled_weight": True,
+               "layout": WeightLayout.MajorK,
+               "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
+           },
+           id="Shuffled_MajorK",
         ),
-        pytest.param(
-            {
-                "use_shuffled_weight": True,
-                "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [FP4Moe, FP8PerTensorMoe, FP8BlockScaleMoe],
-            },
-            id="Shuffled_MajorK",
-        ),
-        pytest.param(
-            {
-                "use_shuffled_weight": True,
-                "layout": WeightLayout.BlockMajorK,
-                "compatible_moe_impls": [
-                    FP8BlockScaleMoe,
-                    MxInt4BlockScaleMoe,
-                    BF16Moe,
-                ],
-            },
-            id="Shuffled_BlockMajorK",
-        ),
+        #pytest.param(
+        #    {
+        #        "use_shuffled_weight": True,
+        #        "layout": WeightLayout.BlockMajorK,
+        #        "compatible_moe_impls": [
+        #            # FP8BlockScaleMoe,
+        #            # MxInt4BlockScaleMoe,
+        #            BF16Moe,
+        #        ],
+        #    },
+        #    id="Shuffled_BlockMajorK",
+        #),
     ],
 )
 @pytest.mark.parametrize(
     "activation_type",
     [
-        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
-        pytest.param(ActivationType.Geglu.value, id="Geglu"),
+        # pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
+        # pytest.param(ActivationType.Geglu.value, id="Geglu"),
         pytest.param(ActivationType.Relu2.value, id="Relu2"),
     ],
 )

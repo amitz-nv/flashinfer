@@ -1293,16 +1293,40 @@ class AutoTuner:
                                 and len(valid_tactics) > 0
                             ):
                                 r(tensors, tactic=-1, do_preparation=True, **kwargs)
-                            for tac in valid_tactics:
+                            for tac_idx, tac in enumerate(valid_tactics):
                                 try:
+                                    shapes = self._get_input_sizes(tensors)
+                                    # Try to get config description for this tactic
+                                    tac_desc = ""
+                                    if hasattr(r, 'get_tactic_description'):
+                                        try:
+                                            tac_desc = r.get_tactic_description(tensors, tac_idx)
+                                            if tac_desc:
+                                                tac_desc = f" config=[{tac_desc}]"
+                                        except Exception:
+                                            pass
+                                    print(f"[Autotuner DEBUG]: Profiling step={_step} runner={r} tactic={tac} shapes={shapes}{tac_desc}", flush=True)
+                                    # Require BOTH FC1 and FC2 to use PersistentSm90 (schPdE) scheduler.
+                                    # The tac_desc contains "FC1:[...] FC2:[...]" — check each part independently.
+                                    if tac_desc:
+                                        #if "schPdE" in tac_desc:
+                                        #    print("Skipping schPde")
+                                        #    continue
+                                        fc1_part = tac_desc.split("FC2:")[0] if "FC2:" in tac_desc else tac_desc
+                                        fc2_part = tac_desc.split("FC2:")[1] if "FC2:" in tac_desc else ""
+                                        if "schPdE" not in fc1_part or (fc2_part and "schPdE" not in fc2_part):
+                                            print(f"[Autotuner DEBUG]: Skipping non schPdE (FC1 has schPdE: {'schPdE' in fc1_part}, FC2 has schPdE: {'schPdE' in fc2_part})", flush=True)
+                                            continue
                                     time_measured = self._profile_single_kernel(
                                         r, tensors, tac, tuning_config, **kwargs
                                     )
+                                    print(f"[Autotuner DEBUG]: -> OK time={time_measured:.4f}ms", flush=True)
                                 except torch.cuda.OutOfMemoryError:
                                     raise
                                 except Exception as e:
                                     skipped_count += 1
                                     shapes = self._get_input_sizes(tensors)
+                                    print(f"[Autotuner DEBUG]: -> FAILED step={_step} runner={r} tactic={tac} shapes={shapes} error={e}", flush=True)
                                     logger.debug(
                                         f"[Autotuner]: Skipping tactic {r} {tac}, due to failure while profiling: {e}"
                                     )

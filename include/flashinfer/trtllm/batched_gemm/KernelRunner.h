@@ -19,6 +19,7 @@
 #include <cuda.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export/Enums.h"
@@ -108,7 +109,8 @@ class TrtllmGenBatchedGemmRunner {
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
            int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-           int32_t configIndex, bool enable_pdl);
+           int32_t configIndex, bool enable_pdl, uint32_t* dynamicTileCounter = nullptr,
+           void* pinnedHostBuffer = nullptr);
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
@@ -147,6 +149,9 @@ class TrtllmGenBatchedGemmRunner {
                                         std::vector<int32_t> const& batchedTokens,
                                         int32_t numTokens, int32_t numBatches,
                                         int32_t maxNumCtasInBatchDim) const;
+
+  // Get a human-readable description of a config by its global index in getBatchedGemmConfigs()
+  [[nodiscard]] std::string getConfigDescription(int64_t globalConfigIndex) const;
 
  private:
   void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,

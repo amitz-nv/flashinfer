@@ -447,7 +447,8 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
                  int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
                  int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace,
                  bool useRoutingScalesOnInput, int device, cudaStream_t stream, int32_t configIndex,
-                 bool enable_pdl) {
+                 bool enable_pdl,
+                 uint32_t* dynamicTileCounter, void* pinnedHostBuffer) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   int32_t intermediateSizeFactor = (isGatedActivation(mActType) ? 2 : 1);
@@ -464,7 +465,8 @@ void Runner::run(void* hiddenState, void* hiddenStateScale, void* weights, void*
               outputScalesGateScalar, reinterpret_cast<float const*>(ptrBias), ptrAlpha, ptrBeta,
               ptrClampLimit, output, outputScale, permutedIdxToTokenIdx, ptrTotalNumPaddedTokens,
               ptrCtaIdxXyToBatchIdx, ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas,
-              permutedIdxToBiasRowIdx, bmm1Workspace, stream, device, configIndex, enable_pdl);
+              permutedIdxToBiasRowIdx, bmm1Workspace, stream, device, configIndex, enable_pdl,
+              dynamicTileCounter, pinnedHostBuffer);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -505,6 +507,10 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
 
 std::vector<int64_t> Runner::getPassingConfigIndices() const {
   return mRunner.getPassingConfigIndices();
+}
+
+std::string Runner::getConfigDescription(int64_t passingConfigIndex) const {
+  return mRunner.getConfigDescription(passingConfigIndex);
 }
 }  // namespace PermuteGemm1
 
@@ -551,7 +557,8 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
                  int32_t topK, int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts,
                  int32_t numTokens, int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
                  int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
-                 int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl) {
+                 int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+                 uint32_t* dynamicTileCounter, void* pinnedHostBuffer) {
   auto maxNumCtasInBatchDim =
       Routing::getMaxNumCtasInBatchDim(numTokens, topK, numExperts, mTileTokensDim);
   mRunner.run(
@@ -563,7 +570,7 @@ void Runner::run(void* permutedHiddenState, void* permutedHiddenStateScale, void
       /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* clampLimit */ nullptr, output, outputScale,
       /* permutedIdxToTokenIdx */ nullptr, ptrTotalNumPaddedTokens, ptrCtaIdxXyToBatchIdx,
       ptrCtaIdxXyToMnLimit, ptrNumNonExitingCtas, /* permutedIdxToBiasRowIdx */ nullptr,
-      bmm2Workspace, stream, device, configIndex, enable_pdl);
+      bmm2Workspace, stream, device, configIndex, enable_pdl, dynamicTileCounter, pinnedHostBuffer);
 }
 
 size_t Runner::getWorkspaceSizeInBytes(int32_t topK, int32_t hiddenSize, int32_t intermediateSize,
@@ -599,6 +606,10 @@ bool Runner::isValidConfigIndex(int32_t configIndex, int32_t topK, int32_t hidde
 
 std::vector<int64_t> Runner::getPassingConfigIndices() const {
   return mRunner.getPassingConfigIndices();
+}
+
+std::string Runner::getConfigDescription(int64_t passingConfigIndex) const {
+  return mRunner.getConfigDescription(passingConfigIndex);
 }
 }  // namespace Gemm2
 
@@ -753,6 +764,15 @@ int64_t Runner::getDefaultValidConfigIndex(int32_t topK, int32_t hiddenSize,
   return std::distance(mPassingConfigs.begin(), it);
 }
 
+std::string Runner::getConfigDescription(int64_t configIndex) const {
+  if (configIndex < 0 || configIndex >= static_cast<int64_t>(mPassingConfigs.size())) {
+    return "invalid_moe_config_index=" + std::to_string(configIndex);
+  }
+  auto const& config = mPassingConfigs[configIndex];
+  return "FC1:[" + mPermuteGemm1.getConfigDescription(config.gemm1Config) + "] FC2:[" +
+         mGemm2.getConfigDescription(config.gemm2Config) + "]";
+}
+
 void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int device,
                  cudaStream_t stream, int64_t configIndex, bool enable_pdl) {
   FLASHINFER_CHECK(configIndex >= 0 && configIndex < static_cast<int64_t>(mPassingConfigs.size()),
@@ -783,7 +803,8 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
       args.local_num_experts, args.num_tokens, workspace.permuted_idx_to_token_idx,
       workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
       workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit, workspace.bmm1_workspace,
-      args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl);
+      args.mUseRoutingScalesOnInput, device, stream, config.gemm1Config, enable_pdl,
+      workspace.dynamic_tile_counter_fc1, workspace.pinned_host_buffer_fc1);
 
   // We do not fuse activation with FC1 for DeepSeek FP8 due to the weights shuffling constraint.
   void* gemm2_input = workspace.gemm1_output;
@@ -832,7 +853,8 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
              args.hidden_size, args.intermediate_size, args.local_num_experts, args.num_tokens,
              workspace.num_non_exiting_ctas, workspace.total_num_padded_tokens,
              workspace.cta_idx_xy_to_batch_idx, workspace.cta_idx_xy_to_mn_limit,
-             workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl);
+             workspace.bmm2_workspace, device, stream, config.gemm2Config, enable_pdl,
+             workspace.dynamic_tile_counter_fc2, workspace.pinned_host_buffer_fc2);
 
   // Run finalize
   if (args.do_finalize) {

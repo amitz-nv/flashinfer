@@ -227,6 +227,9 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // Get a human-readable description of a config by its passing-config index
+  [[nodiscard]] std::string getConfigDescription(int64_t passingConfigIndex) const;
+
   void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale,
            void* perTokenScales, void* perChannelScales, float* outputScalesScalar,
            float* outputScalesGateScalar, void* ptrBias, float* ptrGatedActAlpha,
@@ -236,7 +239,9 @@ class Runner {
            int32_t* permutedIdxToTokenIdx, int32_t* ptrNumNonExitingCtas,
            int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
            int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           uint32_t* dynamicTileCounter = nullptr,
+           void* pinnedHostBuffer = nullptr);
 
  private:
   friend class MoE::Runner;
@@ -273,13 +278,18 @@ class Runner {
 
   [[nodiscard]] std::vector<int64_t> getPassingConfigIndices() const;
 
+  // Get a human-readable description of a config by its passing-config index
+  [[nodiscard]] std::string getConfigDescription(int64_t passingConfigIndex) const;
+
   void run(void* permutedHiddenState, void* permutedHiddenStateScale, void* weight,
            void* weightScale, void* perTokenScales, void* perChannelScales,
            float* outputScalesScalar, float* ptrBias, void* output, void* outputScale, int32_t topK,
            int32_t hiddenSize, int32_t intermediateSize, int32_t numExperts, int32_t numTokens,
            int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens,
            int32_t* ptrCtaIdxXyToBatchIdx, int32_t* ptrCtaIdxXyToMnLimit, void* bmm2Workspace,
-           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl);
+           int device, cudaStream_t stream, int32_t configIndex, bool enable_pdl,
+           uint32_t* dynamicTileCounter = nullptr,
+           void* pinnedHostBuffer = nullptr);
 
  private:
   friend class MoE::Runner;
@@ -404,6 +414,18 @@ struct MoEWorkspace {
 
   // FC2 workspace:
   void* bmm2_workspace = nullptr;
+
+  // Pre-allocated device counters for PersistentSm90 dynamic tile scheduling.
+  // Separate counters for FC1 and FC2 are required for CUDA graph compatibility:
+  // during graph replay, each kernel must reference its own device address.
+  uint32_t* dynamic_tile_counter_fc1 = nullptr;
+  uint32_t* dynamic_tile_counter_fc2 = nullptr;
+
+  // Pre-allocated pinned host buffers for PersistentSm90 dynamic tile counter initialization.
+  // Separate pinned buffers for FC1 and FC2 are required for CUDA graph compatibility:
+  // cudaMallocHost is not graph-capturable, and a shared buffer causes race conditions.
+  void* pinned_host_buffer_fc1 = nullptr;
+  void* pinned_host_buffer_fc2 = nullptr;
 };
 
 // Config indices to be used with Batched GEMM runners
@@ -442,6 +464,9 @@ class Runner {
                                                    int32_t intermediateSize,
                                                    int32_t numLocalExperts,
                                                    int32_t numTokens) const;
+
+  // Get a human-readable description of a MoE config (FC1 + FC2 kernel names and options)
+  [[nodiscard]] std::string getConfigDescription(int64_t configIndex) const;
 
  private:
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,

@@ -77,6 +77,26 @@ from ..tllm_enums import (
     trtllm_gen_dtype_has_scale,
 )
 
+_pinned_host_fc1: Optional[torch.Tensor] = None
+_pinned_host_fc2: Optional[torch.Tensor] = None
+
+
+def _get_persistent_sm90_buffers(device: torch.device):
+    """Get pre-allocated buffers for PersistentSm90 tile scheduling.
+
+    Returns (dynamic_tile_counter, pinned_host_fc1, pinned_host_fc2).
+    - dynamic_tile_counter: device tensor, 2 x uint32 (one per GEMM), allocated
+      per-call via PyTorch caching allocator (CUDA-graph-aware).
+    - pinned_host_fc1/fc2: module-level pinned host tensors, reused across calls.
+    """
+    global _pinned_host_fc1, _pinned_host_fc2
+    if _pinned_host_fc1 is None:
+        _pinned_host_fc1 = torch.empty(1, dtype=torch.int32, device="cpu").pin_memory()
+    if _pinned_host_fc2 is None:
+        _pinned_host_fc2 = torch.empty(1, dtype=torch.int32, device="cpu").pin_memory()
+    dynamic_tile_counter = torch.zeros(2, dtype=torch.int32, device=device)
+    return dynamic_tile_counter, _pinned_host_fc1, _pinned_host_fc2
+
 
 # Routing input modes for FusedMoE launcher
 # Please keep this in sync with the counterpart defined in csrc/trtllm_fused_moe_kernel_launcher.cu
@@ -1148,6 +1168,8 @@ def get_trtllm_moe_sm100_module():
         # Cache valid tactics to reduce the overhead of re-querying the kernel.
         # TODO(siyuan): directly cache the runners
         valid_tactics_dict = dict()
+        # Cache config info descriptions (same order as valid_tactics_dict entries)
+        config_info_dict = dict()
 
         def __init__(
             self,
@@ -1310,12 +1332,34 @@ def get_trtllm_moe_sm100_module():
                 try:
                     valid_tactics = moe_op.trtllm_get_valid_moe_configs(*instance_key)
                 except Exception as e:
-                    logger.debug(
+                    print(
                         f"[Autotuner]: Failed to get valid tactics for {instance_key}. Error occurred: {e}"
                     )
                     return []
                 MoERunner.valid_tactics_dict[instance_key] = valid_tactics
+                # Also fetch human-readable config descriptions
+                try:
+                    config_info = moe_op.trtllm_get_moe_config_info(*instance_key)
+                    MoERunner.config_info_dict[instance_key] = config_info
+                except Exception:
+                    pass
             return MoERunner.valid_tactics_dict[instance_key]
+
+        def get_tactic_description(self, inputs: List[torch.Tensor], tactic_index: int) -> str:
+            """Get human-readable description of a tactic by its index in the valid tactics list."""
+            moe_inputs = MoEInputs.from_list(inputs)
+            num_tokens = moe_inputs.hidden_states.shape[0]
+            instance_key = (
+                self.dtype_act, self.dtype_weights, self.fp8_quantization_type,
+                self.top_k, self.hidden_size, self.intermediate_size,
+                self.num_local_experts, self.activation_type,
+                self.use_shuffled_weight, self.weight_layout,
+                self.use_per_token_scaling, num_tokens,
+            )
+            infos = MoERunner.config_info_dict.get(instance_key, [])
+            if tactic_index < len(infos):
+                return str(infos[tactic_index])
+            return ""
 
         def forward(
             self,
@@ -1567,6 +1611,9 @@ def get_trtllm_moe_sm100_module():
                     [-1, -1] if tactic == -1 else tactic,
                     kwargs.get("norm_topk_prob", True),
                     kwargs.get("routing_replay_out"),
+                    kwargs.get("dynamic_tile_counter"),
+                    kwargs.get("pinned_host_fc1"),
+                    kwargs.get("pinned_host_fc2"),
                 )
 
     @register_custom_op(
@@ -2301,6 +2348,11 @@ def get_trtllm_moe_sm100_module():
             use_cuda_graph=True,
         )
 
+        # Pre-allocate buffers for PersistentSm90 tile scheduling outside CUDA graph capture
+        dynamic_tile_counter, pinned_host_fc1, pinned_host_fc2 = (
+            _get_persistent_sm90_buffers(hidden_states.device)
+        )
+
         _, tactic = tuner.choose_one(
             "flashinfer::trtllm_fp4_block_scale_moe",
             [moe_runner],
@@ -2330,6 +2382,9 @@ def get_trtllm_moe_sm100_module():
             enable_pdl=enable_pdl,
             do_finalize=do_finalize,
             activation_type=activation_type,
+            dynamic_tile_counter=dynamic_tile_counter,
+            pinned_host_fc1=pinned_host_fc1,
+            pinned_host_fc2=pinned_host_fc2,
         )
 
         # Call the C++ function for block scale MoE
@@ -2370,6 +2425,9 @@ def get_trtllm_moe_sm100_module():
             [-1, -1] if tactic == -1 else tactic,
             norm_topk_prob,
             routing_replay_out,
+            dynamic_tile_counter,
+            pinned_host_fc1,
+            pinned_host_fc2,
         )
         if do_finalize:
             return [output]
@@ -2418,6 +2476,9 @@ def get_trtllm_moe_sm100_module():
         tune_max_num_tokens: int = 8192,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
+        dynamic_tile_counter: Optional[torch.Tensor] = None,
+        pinned_host_fc1: Optional[torch.Tensor] = None,
+        pinned_host_fc2: Optional[torch.Tensor] = None,
     ):
         _ = routing_replay_out
         seq_len = hidden_states.shape[0]

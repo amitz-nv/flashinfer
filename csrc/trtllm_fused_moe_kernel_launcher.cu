@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -40,6 +41,7 @@ using tensorrt_llm::kernels::trtllmgen_moe::MoE::ActivationType;
 using tensorrt_llm::kernels::trtllmgen_moe::Routing::RoutingMethodType;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
+using tvm::ffi::String;
 
 enum class RoutingInputMode {
   FromLogits,          // Mode 1: Compute routing from logits
@@ -471,6 +473,12 @@ class FusedMoeLauncher {
   Tensor gemm2_output;
   Tensor workspace_fc1;
   Tensor workspace_fc2;
+  // Raw pointers to pre-allocated device counters for PersistentSm90 tile scheduling.
+  // Set from Python-allocated tensors (outside CUDA graph capture).
+  uint32_t* dynamic_tile_counter_fc1_ = nullptr;
+  uint32_t* dynamic_tile_counter_fc2_ = nullptr;
+  void* pinned_host_fc1_ = nullptr;
+  void* pinned_host_fc2_ = nullptr;
   Tensor output;
   int64_t moe_tactic{-1};
   std::unique_ptr<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner> moe_runner;
@@ -522,9 +530,24 @@ class FusedMoeLauncher {
     workspace_fc2 = alloc_tensor({std::get<1>(workspace_sizes)}, dl_int8, hidden_states.device());
     workspace.bmm1_workspace = workspace_fc1.data_ptr();
     workspace.bmm2_workspace = workspace_fc2.data_ptr();
+
+    // Device counters and pinned host buffers are pre-allocated by Python
+    // (outside CUDA graph capture) and stored on the launcher.
+    workspace.dynamic_tile_counter_fc1 = dynamic_tile_counter_fc1_;
+    workspace.dynamic_tile_counter_fc2 = dynamic_tile_counter_fc2_;
+    workspace.pinned_host_buffer_fc1 = pinned_host_fc1_;
+    workspace.pinned_host_buffer_fc2 = pinned_host_fc2_;
   }
 
  public:
+  // Public setters for pre-allocated PersistentSm90 buffers (set from free functions).
+  void set_dynamic_tile_counters(uint32_t* fc1, uint32_t* fc2) {
+    dynamic_tile_counter_fc1_ = fc1;
+    dynamic_tile_counter_fc2_ = fc2;
+  }
+  void set_pinned_host_fc1(void* buf) { pinned_host_fc1_ = buf; }
+  void set_pinned_host_fc2(void* buf) { pinned_host_fc2_ = buf; }
+
   virtual void check_routing() const = 0;
   virtual void prepare_routing() = 0;
   virtual void check_moe() const = 0;
@@ -1969,6 +1992,9 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 
       for (auto cfg : cfgs) {
         valid_configs.push_back({tile_N, cfg});
+        // Dump config description for debugging
+        fprintf(stderr, "[FP4 MoE Config] tile_N=%d cfg_idx=%ld %s\n", tile_N,
+                static_cast<long>(cfg), moe_runner->getConfigDescription(cfg).c_str());
       }
     }
 
@@ -1988,7 +2014,10 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
                               Optional<double> routed_scaling_factor, int64_t routing_method_type,
                               bool use_shuffled_weight, int64_t weight_layout, bool do_finalize,
                               bool enable_pdl, Array<int64_t> moe_tactic, int64_t activation_type,
-                              bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+                              bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+                              Optional<TensorView> dynamic_tile_counter,
+                              Optional<TensorView> pinned_host_fc1,
+                              Optional<TensorView> pinned_host_fc2) {
   // Just some basic type validation first and leave more checks to the launcher
   if (routing_logits.has_value()) {
     TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
@@ -2063,6 +2092,18 @@ Array<Tensor> trtllm_bf16_moe(Optional<TensorView> const& routing_logits,
                    "Internal error: missing BF16 MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  // Set pre-allocated buffers for PersistentSm90 tile counter (allocated by Python, outside graph capture)
+  if (dynamic_tile_counter.has_value()) {
+    auto* base = static_cast<uint32_t*>(dynamic_tile_counter.value().data_ptr());
+    selected_launcher->set_dynamic_tile_counters(base, base + 1);
+  }
+  if (pinned_host_fc1.has_value()) {
+    selected_launcher->set_pinned_host_fc1(pinned_host_fc1.value().data_ptr());
+  }
+  if (pinned_host_fc2.has_value()) {
+    selected_launcher->set_pinned_host_fc2(pinned_host_fc2.value().data_ptr());
+  }
+
   // Run the launcher - it will create its own runner internally
   return selected_launcher->run(config, enable_pdl,
                                 /*use_routing_scales_on_input=*/false,
@@ -2078,7 +2119,10 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     int64_t local_expert_offset, int64_t local_num_experts, Optional<double> routed_scaling_factor,
     bool use_routing_scales_on_input, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, Array<int64_t> config_index, int64_t activation_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out,
+    Optional<TensorView> dynamic_tile_counter,
+    Optional<TensorView> pinned_host_fc1,
+    Optional<TensorView> pinned_host_fc2) {
   // Basic type validation
   auto dtype = hidden_states.dtype();
   auto activation = validateAndCastActivationType(activation_type);
@@ -2153,6 +2197,18 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  // Set pre-allocated buffers for PersistentSm90 tile counter (allocated by Python, outside graph capture)
+  if (dynamic_tile_counter.has_value()) {
+    auto* base = static_cast<uint32_t*>(dynamic_tile_counter.value().data_ptr());
+    selected_launcher->set_dynamic_tile_counters(base, base + 1);
+  }
+  if (pinned_host_fc1.has_value()) {
+    selected_launcher->set_pinned_host_fc1(pinned_host_fc1.value().data_ptr());
+  }
+  if (pinned_host_fc2.has_value()) {
+    selected_launcher->set_pinned_host_fc2(pinned_host_fc2.value().data_ptr());
+  }
+
   // Run the launcher - it will create its own runner internally
   return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input);
 }
@@ -2167,7 +2223,10 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool use_shuffled_weight,
     int64_t weight_layout, bool do_finalize, bool enable_pdl, Array<int64_t> config_index,
     Fp8QuantizationType quantization_type, int64_t act_type, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out,
+    Optional<TensorView> dynamic_tile_counter,
+    Optional<TensorView> pinned_host_fc1,
+    Optional<TensorView> pinned_host_fc2) {
   auto activation_type = validateAndCastActivationType(act_type);
   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation semantics.
   // Fail for any other activation to avoid silently running incorrect activation behavior.
@@ -2291,6 +2350,18 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
                    "Internal error: missing FP8 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  // Set pre-allocated buffers for PersistentSm90 tile counter (allocated by Python, outside graph capture)
+  if (dynamic_tile_counter.has_value()) {
+    auto* base = static_cast<uint32_t*>(dynamic_tile_counter.value().data_ptr());
+    selected_launcher->set_dynamic_tile_counters(base, base + 1);
+  }
+  if (pinned_host_fc1.has_value()) {
+    selected_launcher->set_pinned_host_fc1(pinned_host_fc1.value().data_ptr());
+  }
+  if (pinned_host_fc2.has_value()) {
+    selected_launcher->set_pinned_host_fc2(pinned_host_fc2.value().data_ptr());
+  }
+
   // Run the launcher with DeepSeek FP8 enabled - it will create its own runner internally
   return selected_launcher->run(
       config, enable_pdl, false /* use_routing_scales_on_input */,
@@ -2312,7 +2383,10 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, int64_t act_type, TensorView output, Array<int64_t> config_index,
-    bool norm_topk_prob, Optional<TensorView> routing_replay_out) {
+    bool norm_topk_prob, Optional<TensorView> routing_replay_out,
+    Optional<TensorView> dynamic_tile_counter,
+    Optional<TensorView> pinned_host_fc1,
+    Optional<TensorView> pinned_host_fc2) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -2439,6 +2513,28 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
                    "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
 
+  // Set pre-allocated buffers for PersistentSm90 tile counter (allocated by Python, outside graph capture)
+  if (dynamic_tile_counter.has_value()) {
+    auto* base = static_cast<uint32_t*>(dynamic_tile_counter.value().data_ptr());
+    selected_launcher->set_dynamic_tile_counters(base, base + 1);
+    fprintf(stderr, "[FP4 MoE] dynamic_tile_counter: fc1=%p fc2=%p\n",
+            static_cast<void*>(base), static_cast<void*>(base + 1));
+  } else {
+    fprintf(stderr, "[FP4 MoE] dynamic_tile_counter: NOT PROVIDED\n");
+  }
+  if (pinned_host_fc1.has_value()) {
+    selected_launcher->set_pinned_host_fc1(pinned_host_fc1.value().data_ptr());
+    fprintf(stderr, "[FP4 MoE] pinned_host_fc1: %p\n", pinned_host_fc1.value().data_ptr());
+  } else {
+    fprintf(stderr, "[FP4 MoE] pinned_host_fc1: NOT PROVIDED\n");
+  }
+  if (pinned_host_fc2.has_value()) {
+    selected_launcher->set_pinned_host_fc2(pinned_host_fc2.value().data_ptr());
+    fprintf(stderr, "[FP4 MoE] pinned_host_fc2: %p\n", pinned_host_fc2.value().data_ptr());
+  } else {
+    fprintf(stderr, "[FP4 MoE] pinned_host_fc2: NOT PROVIDED\n");
+  }
+
   // Run the launcher - it will create its own runner internally
   return selected_launcher->run(config, enable_pdl);
 }
@@ -2453,7 +2549,10 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     int64_t intermediate_size, int64_t local_expert_offset, int64_t local_num_experts,
     Optional<double> routed_scaling_factor, int64_t routing_method_type, bool do_finalize,
     bool enable_pdl, TensorView output, Array<int64_t> config_index, bool norm_topk_prob,
-    Optional<TensorView> routing_replay_out) {
+    Optional<TensorView> routing_replay_out,
+    Optional<TensorView> dynamic_tile_counter,
+    Optional<TensorView> pinned_host_fc1,
+    Optional<TensorView> pinned_host_fc2) {
   // Determine data types based on input format
   int const num_tokens = hidden_states.size(0);
   int hidden_size = hidden_states.size(1);
@@ -2539,6 +2638,18 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
   FLASHINFER_CHECK(launcher_it != launchers_map.end(),
                    "Internal error: missing MXINT4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
+
+  // Set pre-allocated buffers for PersistentSm90 tile counter (allocated by Python, outside graph capture)
+  if (dynamic_tile_counter.has_value()) {
+    auto* base = static_cast<uint32_t*>(dynamic_tile_counter.value().data_ptr());
+    selected_launcher->set_dynamic_tile_counters(base, base + 1);
+  }
+  if (pinned_host_fc1.has_value()) {
+    selected_launcher->set_pinned_host_fc1(pinned_host_fc1.value().data_ptr());
+  }
+  if (pinned_host_fc2.has_value()) {
+    selected_launcher->set_pinned_host_fc2(pinned_host_fc2.value().data_ptr());
+  }
 
   // Run the launcher - it will create its own runner internally
   return selected_launcher->run(config, enable_pdl,
@@ -2627,6 +2738,60 @@ Array<Array<int64_t>> trtllm_get_valid_moe_configs(
   return Array<Array<int64_t>>();
 }
 
+// Returns human-readable descriptions for each valid MoE config, in the same order
+// as trtllm_get_valid_moe_configs. Each description includes kernel function names,
+// tile sizes, cluster dims, threads, and shared memory for both FC1 and FC2.
+Array<String> trtllm_get_moe_config_info(
+    int64_t const dtype_act_, int64_t const dtype_weights_,
+    Fp8QuantizationType fp8_quantization_type, int64_t const top_k, int64_t const hidden_size,
+    int64_t const intermediate_size, int64_t const num_local_experts, int64_t const act_type,
+    bool const use_shuffled_weight, int64_t const weight_layout, bool const use_per_token_scaling,
+    int64_t const num_tokens) {
+  auto dtype_act = static_cast<btg::Dtype>(dtype_act_);
+  auto dtype_weights = static_cast<btg::Dtype>(dtype_weights_);
+  Array<String> descriptions;
+
+  // Helper lambda that creates MoE runners and collects config descriptions
+  auto collect_descriptions = [&](btg::Dtype dAct, btg::Dtype dWeights, bool useDeepSeekFp8,
+                                  std::vector<int32_t> const& tile_sizes, int64_t actType,
+                                  bool useShuffled,
+                                  batchedGemm::gemm::MatrixLayout wLayout,
+                                  bool perTokenScaling) {
+    std::set<int32_t> selected_tile_nums =
+        computeSelectedTileN(tile_sizes, num_tokens, top_k, num_local_experts);
+
+    for (int32_t tile_N : selected_tile_nums) {
+      try {
+        auto moe_runner = std::make_unique<tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner>(
+            dAct, dWeights, useDeepSeekFp8, tile_N,
+            static_cast<ActivationType>(actType),
+            useShuffled, wLayout, perTokenScaling, perTokenScaling, false, false);
+
+        auto cfgs = moe_runner->getValidConfigIndices(top_k, hidden_size, intermediate_size,
+                                                      num_local_experts, num_tokens);
+        for (auto cfg : cfgs) {
+          std::string desc = "tile_N=" + std::to_string(tile_N) + " cfg_idx=" +
+                             std::to_string(cfg) + " " + moe_runner->getConfigDescription(cfg);
+          descriptions.push_back(desc);
+        }
+      } catch (...) {
+        // Skip tile sizes that have no matching cubins
+        continue;
+      }
+    }
+  };
+
+  if (dtype_weights == btg::Dtype::E2m1 || dtype_weights == btg::Dtype::MxE2m1) {
+    // FP4 block scale path
+    std::vector<int32_t> tile_sizes = FP4BlockScaleLauncher::getSupportedTileNums(dtype_act);
+    collect_descriptions(dtype_act, dtype_weights, false, tile_sizes, act_type,
+                         true, batchedGemm::gemm::MatrixLayout::MajorK, use_per_token_scaling);
+  }
+  // Add other dtype paths as needed for debugging
+
+  return descriptions;
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -2637,5 +2802,6 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp8_block_scale_moe, trtllm_fp8_block_scale
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_fp4_block_scale_moe, trtllm_fp4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_mxint4_block_scale_moe, trtllm_mxint4_block_scale_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_valid_moe_configs, trtllm_get_valid_moe_configs);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_get_moe_config_info, trtllm_get_moe_config_info);
 
 }  // namespace flashinfer

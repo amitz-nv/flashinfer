@@ -15,6 +15,7 @@
  */
 
 #include <cstring>
+#include <sstream>
 #include <vector>
 
 #include "flashinfer/trtllm/batched_gemm/KernelRunner.h"
@@ -208,7 +209,8 @@ void TrtllmGenBatchedGemmRunner::run(
     int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
     int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
     int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-    int32_t configIndex, bool enable_pdl) {
+    int32_t configIndex, bool enable_pdl,
+    uint32_t* dynamicTileCounter, void* pinnedHostBuffer) {
   auto bmm = BatchedGemmInterface();
 
   BatchedGemmData gemmData{};
@@ -288,6 +290,12 @@ void TrtllmGenBatchedGemmRunner::run(
   // Pointer used to gather bias rows when mBiasType == BiasType::Mn
   gemmData.mInputBuffers.mPtrPermutedIdxToBiasRowIdx = permutedIdxToBiasRowIdx;
 
+  void* pinnedBuf = nullptr;
+  if (config.mOptions.mTileScheduler == TileScheduler::PersistentSm90) {
+    gemmData.mInputBuffers.mPtrDynamicTileCounter = dynamicTileCounter;
+    pinnedBuf = pinnedHostBuffer;
+  }
+
   // Outputs
   gemmData.mOutputBuffers.mPtrC = c;
   gemmData.mOutputBuffers.mPtrSfC = outSfC;
@@ -300,7 +308,9 @@ void TrtllmGenBatchedGemmRunner::run(
 
   auto const err =
       bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-              enable_pdl, /*pinnedHostBuffer=*/nullptr, globalTrtllmGenBatchedGemmModuleCache);
+              enable_pdl,
+              pinnedBuf,
+              globalTrtllmGenBatchedGemmModuleCache);
 
   FLASHINFER_CHECK(err == 0,
                    "Error occurred when running GEMM!"
@@ -449,10 +459,23 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(
       prioritizePredefinedConfigs(m, n, k, sortedIndices, configs);
 
   // Filter out invalid configs.
+  // CUDA grid dimension limit is 65535. For non-persistent schedulers with batchN
+  // (transposeMmaOutput=true), gridDim.Y = maxNumCtasInBatchDim * clusterDimInBatchDim.
+  // When this exceeds 65535, only PersistentSm90 (which uses a fixed grid) is supported.
+  bool const batchM = !mOptions.transposeMmaOutput;
   std::vector<int64_t> validConfigIndices;
   for (auto const& configIndex : prioritizedIndices) {
     auto isValidConfig = bmm.isValidConfig(configs[configIndex], gemmData);
     if (isValidConfig) {
+      auto const& opts = configs[configIndex].mOptions;
+      int32_t clusterDimInBatchDim = batchM ? opts.mClusterDimX : opts.mClusterDimY;
+      int64_t numCtasBatch =
+          static_cast<int64_t>(gemmData.mProblemDimensions.mMaxNumCtasInTokenDim) *
+          clusterDimInBatchDim;
+      if (numCtasBatch > 65535 &&
+          opts.mTileScheduler != batchedGemm::gemm::TileScheduler::PersistentSm90) {
+        continue;
+      }
       validConfigIndices.push_back(configIndex);
     }
   }
@@ -505,6 +528,25 @@ bool TrtllmGenBatchedGemmRunner::isValidConfigIndex(int32_t configIndex, int32_t
   auto const& config = configs[configIndex];
 
   return bmm.isValidConfig(config, gemmData);
+}
+
+std::string TrtllmGenBatchedGemmRunner::getConfigDescription(int64_t globalConfigIndex) const {
+  auto const bmm = BatchedGemmInterface();
+  auto numConfigs = static_cast<int64_t>(bmm.getNumBatchedGemmConfigs());
+  if (globalConfigIndex < 0 || globalConfigIndex >= numConfigs) {
+    return "invalid_global_index=" + std::to_string(globalConfigIndex) + "(max=" +
+           std::to_string(numConfigs) + ")";
+  }
+  auto const* configs = bmm.getBatchedGemmConfigs();
+  auto const& cfg = configs[globalConfigIndex];
+  auto const& opts = cfg.mOptions;
+
+  std::stringstream ss;
+  ss << "kernel=" << (cfg.mFunctionName ? cfg.mFunctionName : "null")
+     << " tileM=" << opts.mTileM << " tileN=" << opts.mTileN << " tileK=" << opts.mTileK
+     << " cluster=" << opts.mClusterDimX << "x" << opts.mClusterDimY << "x" << opts.mClusterDimZ
+     << " threads=" << cfg.mNumThreadsPerCTA << " smem=" << cfg.mSharedMemSize;
+  return ss.str();
 }
 
 }  // namespace kernels
