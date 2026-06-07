@@ -415,15 +415,9 @@ struct MoEWorkspace {
   // FC2 workspace:
   void* bmm2_workspace = nullptr;
 
-  // Pre-allocated device counters for PersistentSm90 dynamic tile scheduling.
-  // Separate counters for FC1 and FC2 are required for CUDA graph compatibility:
-  // during graph replay, each kernel must reference its own device address.
   uint32_t* dynamic_tile_counter_fc1 = nullptr;
   uint32_t* dynamic_tile_counter_fc2 = nullptr;
 
-  // Pre-allocated pinned host buffers for PersistentSm90 dynamic tile counter initialization.
-  // Separate pinned buffers for FC1 and FC2 are required for CUDA graph compatibility:
-  // cudaMallocHost is not graph-capturable, and a shared buffer causes race conditions.
   void* pinned_host_buffer_fc1 = nullptr;
   void* pinned_host_buffer_fc2 = nullptr;
 };
